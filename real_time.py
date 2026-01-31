@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+import asyncio
+import json
+import sounddevice as sd
+import numpy as np
+import websockets
+
+# Audio parameters
+SAMPLE_RATE = 16000
+BUFFER_SIZE = 1024
+
+# WebSocket server URL (via SSH tunnel)
+SERVER_URL = "ws://localhost:8765"
+
+# Global queue for audio chunks
+audio_queue = asyncio.Queue()
+
+def audio_callback(indata, frames, time, status):
+    """Callback function to capture audio data."""
+    if status:
+        print(status)
+    # Put audio data into asyncio queue
+    asyncio.create_task(audio_queue.put(indata.copy()))
+
+async def send_audio(websocket):
+    """Send audio chunks to the server."""
+    while True:
+        audio_chunk = await audio_queue.get()
+        # Convert numpy array to bytes and send as binary
+        await websocket.send(audio_chunk.tobytes())
+
+async def receive_transcriptions(websocket):
+    """Receive transcription results from the server."""
+    async for message in websocket:
+        data = json.loads(message)
+        if data.get("type") == "transcription":
+            print(f"Transcription: {data['text']}")
+        elif data.get("type") == "ack":
+            print(f"Server status: {data['status']}")
+
+async def main():
+    """Main client function."""
+    print(f"Connecting to server at {SERVER_URL}...")
+    
+    try:
+        async with websockets.connect(SERVER_URL) as websocket:
+            print("Connected to server!")
+            
+            # Send configuration handshake
+            config = {
+                "type": "config",
+                "sample_rate": SAMPLE_RATE,
+                "dtype": "float32",
+                "channels": 1
+            }
+            await websocket.send(json.dumps(config))
+            print("Configuration sent")
+            
+            # Start audio stream
+            with sd.InputStream(
+                callback=audio_callback, 
+                channels=1, 
+                samplerate=SAMPLE_RATE, 
+                blocksize=BUFFER_SIZE
+            ):
+                print("Listening... Press Ctrl+C to stop.")
+                
+                # Run send and receive tasks concurrently
+                await asyncio.gather(
+                    send_audio(websocket),
+                    receive_transcriptions(websocket)
+                )
+    
+    except websockets.exceptions.WebSocketException as e:
+        print(f"WebSocket error: {e}")
+        print("\nMake sure:")
+        print("1. The server is running on the remote machine")
+        print("2. SSH tunnel is active: ssh -L 8765:localhost:8765 user@server-hostname")
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
