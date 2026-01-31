@@ -36,7 +36,21 @@ async def receive_transcriptions(websocket):
     async for message in websocket:
         data = json.loads(message)
         if data.get("type") == "transcription":
-            print(f"Transcription: {data['text']}")
+            # Handle both old format (text) and new format (segments)
+            if "segments" in data:
+                # New format with speaker diarization
+                segments = data["segments"]
+                print("\n=== Transcription ===")
+                for seg in segments:
+                    speaker = seg.get("speaker", "UNKNOWN")
+                    text = seg.get("text", "")
+                    start = seg.get("start", 0)
+                    end = seg.get("end", 0)
+                    print(f"[{speaker}] ({start:.1f}s-{end:.1f}s): {text}")
+                print("====================\n")
+            else:
+                # Old format (backward compatibility)
+                print(f"Transcription: {data['text']}")
         elif data.get("type") == "ack":
             print(f"Server status: {data['status']}")
 

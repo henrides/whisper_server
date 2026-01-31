@@ -12,6 +12,13 @@ tqdm>=4.60.0
 
 # Audio processing
 numba>=0.57.0
+torchaudio>=2.2.0
+
+# Speaker diarization
+speechbrain>=1.0.0
+scikit-learn>=1.0.0
+sentencepiece>=0.1.96
+huggingface_hub<1.0.0
 
 # Networking
 requests>=2.25.0
