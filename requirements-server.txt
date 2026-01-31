@@ -1,0 +1,17 @@
+# Server Requirements - For the machine running Whisper transcription
+# Install with: pip install -r requirements-server.txt
+
+# Core dependencies
+numpy>=2.0.0
+websockets>=16.0
+
+# Whisper and its dependencies
+openai-whisper>=20250625
+torch>=2.0.0
+tqdm>=4.60.0
+
+# Audio processing
+numba>=0.57.0
+
+# Networking
+requests>=2.25.0

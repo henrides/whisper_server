@@ -12,15 +12,17 @@ BUFFER_SIZE = 1024
 # WebSocket server URL (via SSH tunnel)
 SERVER_URL = "ws://localhost:8765"
 
-# Global queue for audio chunks
+# Global queue for audio chunks and event loop reference
 audio_queue = asyncio.Queue()
+loop = None
 
 def audio_callback(indata, frames, time, status):
     """Callback function to capture audio data."""
     if status:
         print(status)
-    # Put audio data into asyncio queue
-    asyncio.create_task(audio_queue.put(indata.copy()))
+    # Put audio data into asyncio queue in a thread-safe way
+    if loop is not None:
+        loop.call_soon_threadsafe(audio_queue.put_nowait, indata.copy())
 
 async def send_audio(websocket):
     """Send audio chunks to the server."""
@@ -40,6 +42,9 @@ async def receive_transcriptions(websocket):
 
 async def main():
     """Main client function."""
+    global loop
+    loop = asyncio.get_running_loop()
+    
     print(f"Connecting to server at {SERVER_URL}...")
     
     try:

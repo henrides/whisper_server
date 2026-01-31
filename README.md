@@ -22,7 +22,7 @@ cd whisper_test
 ```bash
 python3 -m venv whisper_env
 source whisper_env/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-server.txt
 ```
 
 3. Run the server:
@@ -34,9 +34,20 @@ The server will listen on `localhost:8765` and load the Whisper model on startup
 
 ### Client Setup (Local Machine)
 
-1. Clone the repository and install dependencies (same as server setup steps 1-2)
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd whisper_test
+```
 
-2. Establish SSH tunnel to the server:
+2. Create virtual environment and install dependencies:
+```bash
+python3 -m venv whisper_env
+source whisper_env/bin/activate
+pip install -r requirements-client.txt
+```
+
+3. Establish SSH tunnel to the server:
 ```bash
 ssh -L 8765:localhost:8765 user@server-hostname
 ```

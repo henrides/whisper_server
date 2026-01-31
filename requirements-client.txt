@@ -1,0 +1,9 @@
+# Client Requirements - For the machine capturing audio
+# Install with: pip install -r requirements-client.txt
+
+# Core dependencies
+numpy>=2.0.0
+websockets>=16.0
+
+# Audio capture
+sounddevice>=0.4.0
