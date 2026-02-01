@@ -30,14 +30,14 @@ speaker_database = []
 
 # Audio parameters
 SAMPLE_RATE = 16000
-CHUNK_BUFFER_SIZE = 50  # Number of chunks to accumulate before transcribing
+
 
 # Speaker diarization parameters
-EMBEDDING_WINDOW_SIZE = 3.0  # seconds
-EMBEDDING_WINDOW_OVERLAP = 1.0  # seconds
-SPEAKER_SIMILARITY_THRESHOLD = 0.4  # cosine similarity threshold for speaker matching (lowered further)
-CLUSTERING_DISTANCE_THRESHOLD = 0.5  # distance threshold for clustering (lowered to group similar speakers)
-MAX_EMBEDDINGS_PER_SPEAKER = 10  # Maximum embeddings to store per speaker
+EMBEDDING_WINDOW_SIZE = 2.0  # seconds (shorter windows for better speaker changes)
+EMBEDDING_WINDOW_OVERLAP = 0.5  # seconds (less overlap for more distinct segments)
+SPEAKER_SIMILARITY_THRESHOLD = 0.75  # cosine similarity threshold (higher = stricter matching)
+CLUSTERING_DISTANCE_THRESHOLD = 0.3  # distance threshold for clustering (lower = more clusters/speakers)
+MAX_EMBEDDINGS_PER_SPEAKER = 15  # Maximum embeddings to store per speaker
 
 def extract_speaker_embeddings(audio_data, sample_rate):
     """
@@ -106,19 +106,23 @@ def match_speaker_to_database(embedding, threshold=SPEAKER_SIMILARITY_THRESHOLD)
     for speaker in speaker_database:
         speaker_embeddings = np.array(speaker['embeddings'])
         similarities = cosine_similarity([embedding], speaker_embeddings)[0]
+        # Use median instead of max for more robust matching
+        median_similarity = np.median(similarities)
         max_similarity = np.max(similarities)
+        # Require both high max AND decent median
+        avg_similarity = (max_similarity + median_similarity) / 2
         
-        if max_similarity > best_similarity:
-            best_similarity = max_similarity
+        if avg_similarity > best_similarity:
+            best_similarity = avg_similarity
             best_speaker_id = speaker['id']
     
-    print(f"  Speaker matching: best similarity = {best_similarity:.3f} (threshold = {threshold:.3f})")
+    print(f"  Speaker matching: best avg similarity = {best_similarity:.3f} (threshold = {threshold:.3f})")
     
     if best_similarity >= threshold:
-        print(f"  Matched to existing {best_speaker_id}")
+        print(f"  ✓ Matched to existing {best_speaker_id}")
         return best_speaker_id
     
-    print(f"  No match found, will create new speaker")
+    print(f"  ✗ No match found (similarity too low), will create new speaker")
     return None
 
 def cluster_and_label_speakers(embeddings_list):
@@ -166,6 +170,7 @@ def cluster_and_label_speakers(embeddings_list):
         return embeddings_list
     
     # Perform agglomerative clustering
+    print(f"  Clustering {len(embeddings)} embeddings...")
     clustering = AgglomerativeClustering(
         n_clusters=None,
         distance_threshold=CLUSTERING_DISTANCE_THRESHOLD,
@@ -174,6 +179,8 @@ def cluster_and_label_speakers(embeddings_list):
     )
     
     cluster_labels = clustering.fit_predict(embeddings)
+    n_clusters = len(np.unique(cluster_labels))
+    print(f"  Found {n_clusters} distinct speaker clusters in this chunk")
     
     # Map cluster labels to global speaker IDs
     cluster_to_speaker = {}
@@ -199,7 +206,9 @@ def cluster_and_label_speakers(embeddings_list):
                     'id': speaker_id,
                     'embeddings': [representative_embedding]
                 })
+                print(f"  Created new {speaker_id} for cluster {cluster_label}")
             else:
+                print(f"  Matched cluster {cluster_label} to existing {speaker_id}")
                 # Add this embedding to the matched speaker's collection
                 for speaker in speaker_database:
                     if speaker['id'] == speaker_id:
@@ -266,11 +275,84 @@ def align_speakers_with_transcription(speaker_segments, transcription_segments):
     
     return aligned_segments
 
+async def process_audio_chunk(audio_data, sample_rate, websocket):
+    """
+    Process a complete audio chunk: extract speakers and transcribe.
+    
+    Args:
+        audio_data: numpy array of audio samples
+        sample_rate: audio sample rate
+        websocket: WebSocket connection to send results
+    """
+    duration = len(audio_data) / sample_rate
+    print(f"\n{'='*60}")
+    print(f"Processing audio chunk: {duration:.1f} seconds")
+    print(f"{'='*60}")
+    
+    # Extract speaker embeddings
+    print("Extracting speaker embeddings...")
+    speaker_segments = await asyncio.to_thread(
+        extract_speaker_embeddings,
+        audio_data,
+        sample_rate
+    )
+    
+    # Cluster and label speakers
+    print("Clustering speakers...")
+    speaker_segments = await asyncio.to_thread(
+        cluster_and_label_speakers,
+        speaker_segments
+    )
+    
+    # Run Whisper transcription with timestamps (using better settings for accuracy)
+    print("Transcribing with Whisper...")
+    result = await asyncio.to_thread(
+        model.transcribe,
+        audio_data,
+        language="en",
+        verbose=False,
+        temperature=0.0,  # More deterministic for accuracy
+        best_of=5,  # Try multiple decodings
+        beam_size=5  # Use beam search for better accuracy
+    )
+    
+    # Get segments with timestamps
+    transcription_segments = result.get('segments', [])
+    
+    if transcription_segments:
+        # Align speakers with transcription
+        print("Aligning speakers with transcription...")
+        aligned_segments = align_speakers_with_transcription(
+            speaker_segments,
+            transcription_segments
+        )
+        
+        # Filter out empty segments
+        aligned_segments = [s for s in aligned_segments if s['text']]
+        
+        if aligned_segments:
+            print(f"\nTranscription complete: {len(aligned_segments)} segments")
+            for seg in aligned_segments:
+                print(f"  [{seg['speaker']}] ({seg['start']:.1f}s-{seg['end']:.1f}s): {seg['text']}")
+            
+            # Send segmented transcription result back to client
+            await websocket.send(json.dumps({
+                "type": "transcription",
+                "segments": aligned_segments,
+                "duration": duration
+            }))
+            print(f"Results sent to client")
+        else:
+            print("No transcription content after filtering")
+    else:
+        print("No transcription segments detected")
+    
+    print(f"{'='*60}\n")
+
 async def handle_client(websocket):
     """Handle a single client connection."""
     print(f"Client connected: {websocket.remote_address}")
     
-    audio_buffer = []
     sample_rate = SAMPLE_RATE
     dtype = np.float32
     
@@ -289,69 +371,15 @@ async def handle_client(websocket):
                     await websocket.send(json.dumps({"type": "ack", "status": "ready"}))
             
             elif isinstance(message, bytes):
-                # Binary message (audio data)
-                audio_chunk = np.frombuffer(message, dtype=dtype)
-                audio_buffer.append(audio_chunk)
+                # Binary message (audio chunk from client)
+                # Client has already done silence detection and buffering
+                audio_data = np.frombuffer(message, dtype=dtype).flatten()
+                duration = len(audio_data) / sample_rate
                 
-                # Transcribe when buffer is full enough
-                if len(audio_buffer) >= CHUNK_BUFFER_SIZE:
-                    print(f"Processing {len(audio_buffer)} chunks...")
-                    
-                    # Concatenate all audio chunks
-                    audio_data = np.concatenate(audio_buffer)
-                    audio_flat = audio_data.flatten()
-                    
-                    # Extract speaker embeddings
-                    print("Extracting speaker embeddings...")
-                    speaker_segments = await asyncio.to_thread(
-                        extract_speaker_embeddings,
-                        audio_flat,
-                        sample_rate
-                    )
-                    
-                    # Cluster and label speakers
-                    print("Clustering speakers...")
-                    speaker_segments = await asyncio.to_thread(
-                        cluster_and_label_speakers,
-                        speaker_segments
-                    )
-                    
-                    # Run Whisper transcription with timestamps
-                    print("Transcribing...")
-                    result = await asyncio.to_thread(
-                        model.transcribe,
-                        audio_flat,
-                        language="en",
-                        verbose=False
-                    )
-                    
-                    # Get segments with timestamps
-                    transcription_segments = result.get('segments', [])
-                    
-                    if transcription_segments:
-                        # Align speakers with transcription
-                        print("Aligning speakers with transcription...")
-                        aligned_segments = align_speakers_with_transcription(
-                            speaker_segments,
-                            transcription_segments
-                        )
-                        
-                        # Filter out empty segments
-                        aligned_segments = [s for s in aligned_segments if s['text']]
-                        
-                        if aligned_segments:
-                            print(f"Transcription: {len(aligned_segments)} segments")
-                            for seg in aligned_segments:
-                                print(f"  [{seg['speaker']}] {seg['text']}")
-                            
-                            # Send segmented transcription result back to client
-                            await websocket.send(json.dumps({
-                                "type": "transcription",
-                                "segments": aligned_segments
-                            }))
-                    
-                    # Clear buffer after transcription
-                    audio_buffer.clear()
+                print(f"\n📥 Received audio chunk: {duration:.1f}s")
+                
+                # Process the chunk immediately
+                await process_audio_chunk(audio_data, sample_rate, websocket)
     
     except websockets.exceptions.ConnectionClosed:
         print(f"Client disconnected: {websocket.remote_address}")
@@ -364,9 +392,10 @@ async def main():
     """Start the WebSocket server."""
     global model, speaker_encoder
     
-    # Load Whisper model
+    # Load Whisper model (using base model for better accuracy)
     print("Loading Whisper model...")
-    model = whisper.load_model("tiny.en")
+    print("Using 'base.en' model for better accuracy (not real-time, so we can afford it)")
+    model = whisper.load_model("base.en")
     print("Whisper model loaded successfully!")
     
     # Load SpeechBrain speaker encoder
@@ -379,8 +408,17 @@ async def main():
     )
     print("Speaker encoder loaded successfully!")
     
-    print("\nStarting WebSocket server on localhost:8765...")
-    async with websockets.serve(handle_client, "localhost", 8765):
+    print("\nStarting WebSocket server on 0.0.0.0:8765...")
+    # Increase max_size to 16MB and configure heartbeat for long processing
+    # ping_interval=20s, ping_timeout=300s (5 minutes) to handle long transcriptions
+    async with websockets.serve(
+        handle_client, 
+        "0.0.0.0", 
+        8765, 
+        max_size=16 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=300
+    ):
         print("Server ready! Waiting for connections...")
         await asyncio.Future()  # Run forever
 

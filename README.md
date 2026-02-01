@@ -1,12 +1,21 @@
 # Whisper Audio Transcription - Client/Server
 
-WebSocket-based client-server system for real-time audio transcription using OpenAI's Whisper model. The client captures microphone audio and streams it to a remote server for transcription over an encrypted SSH tunnel.
+WebSocket-based client-server system for **chunk-based** audio transcription with speaker diarization using OpenAI's Whisper model. The client captures microphone audio and streams it to a remote server, which buffers the audio and transcribes it in conversational chunks for maximum accuracy.
 
 ## Architecture
 
-- **Client** (`real_time.py`): Captures microphone audio with `sounddevice` and streams it via WebSocket
-- **Server** (`whisper_server.py`): Receives audio streams, runs Whisper transcription, and sends results back
+- **Client** (`whisper_client.py`): Captures microphone audio with `sounddevice` and streams it via WebSocket
+- **Server** (`whisper_server.py`): Receives audio streams, buffers them, detects conversation breaks, runs Whisper transcription with speaker diarization, and sends results back
 - **Transport**: WebSocket over SSH tunnel for encrypted communication
+- **Transcription Strategy**: Chunk-based with silence detection (not real-time) for improved accuracy
+
+## Key Features
+
+- **Silence Detection**: Automatically detects conversation breaks (60+ seconds of silence) to trigger transcription
+- **Speaker Diarization**: Identifies and labels different speakers in the conversation
+- **High Accuracy**: Uses Whisper `base.en` model with beam search and multiple decoding attempts
+- **Smart Buffering**: Buffers audio up to 10 minutes or until silence is detected
+- **Persistent Speaker Database**: Maintains speaker identities across multiple chunks
 
 ## Setup
 
@@ -55,7 +64,7 @@ ssh -L 8765:localhost:8765 user@server-hostname
 3. In a separate terminal, run the client:
 ```bash
 source whisper_env/bin/activate
-python real_time.py
+python whisper_client.py
 ```
 
 The client will connect through the SSH tunnel and start streaming audio.
