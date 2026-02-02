@@ -33,11 +33,12 @@ SAMPLE_RATE = 16000
 
 
 # Speaker diarization parameters
-EMBEDDING_WINDOW_SIZE = 2.0  # seconds (shorter windows for better speaker changes)
-EMBEDDING_WINDOW_OVERLAP = 0.5  # seconds (less overlap for more distinct segments)
-SPEAKER_SIMILARITY_THRESHOLD = 0.75  # cosine similarity threshold (higher = stricter matching)
-CLUSTERING_DISTANCE_THRESHOLD = 0.3  # distance threshold for clustering (lower = more clusters/speakers)
-MAX_EMBEDDINGS_PER_SPEAKER = 15  # Maximum embeddings to store per speaker
+EMBEDDING_WINDOW_SIZE = 4.0  # seconds (longer windows for maximum stability)
+EMBEDDING_WINDOW_OVERLAP = 2.0  # seconds (heavy overlap for consistency)
+SPEAKER_SIMILARITY_THRESHOLD = 0.65  # cosine similarity threshold (lower to account for cross-chunk variance)
+CLUSTERING_DISTANCE_THRESHOLD = 0.60  # distance threshold for clustering (working well)
+MAX_EMBEDDINGS_PER_SPEAKER = 10  # Maximum embeddings to store per speaker (fewer = cleaner profiles)
+MIN_SIMILARITY_TO_ADD = 0.70  # Minimum similarity required to add embedding to existing speaker
 
 def extract_speaker_embeddings(audio_data, sample_rate):
     """
@@ -61,17 +62,24 @@ def extract_speaker_embeddings(audio_data, sample_rate):
         end_sample = start_sample + window_samples
         window = audio_data[start_sample:end_sample]
         
-        # Convert to torch tensor and add batch dimension
-        window_tensor = torch.tensor(window).unsqueeze(0)
+        # DEBUG: Check audio window properties
+        window_rms = np.sqrt(np.mean(window ** 2))
+        
+        # Convert to torch tensor - SpeechBrain expects float32 in range roughly [-1, 1]
+        # Ensure proper dtype and add batch dimension
+        window_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
         
         # Extract embedding
         with torch.no_grad():
             embedding = speaker_encoder.encode_batch(window_tensor)
             embedding = embedding.squeeze().cpu().numpy()
-            # SpeechBrain embeddings should already be normalized, but ensure it
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
+            
+            # DEBUG: Check embedding properties before normalization
+            embedding_norm = np.linalg.norm(embedding)
+            
+            # Normalize embedding to unit length
+            if embedding_norm > 0:
+                embedding = embedding / embedding_norm
         
         # Calculate timestamps
         start_time = start_sample / sample_rate
@@ -80,7 +88,9 @@ def extract_speaker_embeddings(audio_data, sample_rate):
         embeddings.append({
             'embedding': embedding,
             'start': start_time,
-            'end': end_time
+            'end': end_time,
+            'rms': window_rms,  # Store for debugging
+            'original_norm': embedding_norm
         })
     
     return embeddings
@@ -106,14 +116,11 @@ def match_speaker_to_database(embedding, threshold=SPEAKER_SIMILARITY_THRESHOLD)
     for speaker in speaker_database:
         speaker_embeddings = np.array(speaker['embeddings'])
         similarities = cosine_similarity([embedding], speaker_embeddings)[0]
-        # Use median instead of max for more robust matching
-        median_similarity = np.median(similarities)
+        # Use max similarity only for more conservative matching
         max_similarity = np.max(similarities)
-        # Require both high max AND decent median
-        avg_similarity = (max_similarity + median_similarity) / 2
         
-        if avg_similarity > best_similarity:
-            best_similarity = avg_similarity
+        if max_similarity > best_similarity:
+            best_similarity = max_similarity
             best_speaker_id = speaker['id']
     
     print(f"  Speaker matching: best avg similarity = {best_similarity:.3f} (threshold = {threshold:.3f})")
@@ -141,6 +148,16 @@ def cluster_and_label_speakers(embeddings_list):
     # Extract just the embeddings for clustering
     embeddings = np.array([e['embedding'] for e in embeddings_list])
     
+    # DEBUG: Analyze embedding similarities within the batch
+    print(f"  DEBUG: Audio windows RMS: {[round(e['rms'], 4) for e in embeddings_list]}")
+    print(f"  DEBUG: Embedding norms before normalization: {[round(e['original_norm'], 2) for e in embeddings_list]}")
+    if len(embeddings) > 1:
+        similarity_matrix = cosine_similarity(embeddings)
+        # Get upper triangle (excluding diagonal)
+        triu_indices = np.triu_indices(len(embeddings), k=1)
+        pairwise_sims = similarity_matrix[triu_indices]
+        print(f"  DEBUG: Pairwise similarities in batch: min={pairwise_sims.min():.3f}, max={pairwise_sims.max():.3f}, mean={pairwise_sims.mean():.3f}")
+    
     # Handle single embedding case (can't cluster)
     if len(embeddings) == 1:
         representative_embedding = embeddings[0]
@@ -159,11 +176,28 @@ def cluster_and_label_speakers(embeddings_list):
             })
             print(f"  Created new {speaker_id}")
         else:
-            # Add this embedding to the matched speaker's collection
+            # Add this embedding to the matched speaker's collection (with validation)
             for speaker in speaker_database:
                 if speaker['id'] == speaker_id:
-                    if len(speaker['embeddings']) < MAX_EMBEDDINGS_PER_SPEAKER:
-                        speaker['embeddings'].append(representative_embedding)
+                    # Validate similarity before adding to prevent profile pollution
+                    similarities = cosine_similarity([representative_embedding], speaker['embeddings'])[0]
+                    avg_similarity = np.mean(similarities)
+                    if avg_similarity >= MIN_SIMILARITY_TO_ADD:
+                        if len(speaker['embeddings']) < MAX_EMBEDDINGS_PER_SPEAKER:
+                            speaker['embeddings'].append(representative_embedding)
+                            print(f"  Added embedding to {speaker_id} (avg similarity: {avg_similarity:.3f})")
+                        else:
+                            # Replace least representative embedding if new one is better
+                            mean_embedding = np.mean(speaker['embeddings'], axis=0)
+                            mean_embedding = mean_embedding / np.linalg.norm(mean_embedding)
+                            current_sims = cosine_similarity(speaker['embeddings'], [mean_embedding]).flatten()
+                            worst_idx = np.argmin(current_sims)
+                            new_sim = cosine_similarity([representative_embedding], [mean_embedding])[0][0]
+                            if new_sim > current_sims[worst_idx]:
+                                speaker['embeddings'][worst_idx] = representative_embedding
+                                print(f"  Replaced worst embedding in {speaker_id} (new sim: {new_sim:.3f} > old: {current_sims[worst_idx]:.3f})")
+                    else:
+                        print(f"  ⚠ Skipped adding embedding to {speaker_id} (avg similarity too low: {avg_similarity:.3f})")
                     break
         
         embeddings_list[0]['speaker_id'] = speaker_id
@@ -209,11 +243,28 @@ def cluster_and_label_speakers(embeddings_list):
                 print(f"  Created new {speaker_id} for cluster {cluster_label}")
             else:
                 print(f"  Matched cluster {cluster_label} to existing {speaker_id}")
-                # Add this embedding to the matched speaker's collection
+                # Add this embedding to the matched speaker's collection (with validation)
                 for speaker in speaker_database:
                     if speaker['id'] == speaker_id:
-                        if len(speaker['embeddings']) < MAX_EMBEDDINGS_PER_SPEAKER:
-                            speaker['embeddings'].append(representative_embedding)
+                        # Validate similarity before adding to prevent profile pollution
+                        similarities = cosine_similarity([representative_embedding], speaker['embeddings'])[0]
+                        avg_similarity = np.mean(similarities)
+                        if avg_similarity >= MIN_SIMILARITY_TO_ADD:
+                            if len(speaker['embeddings']) < MAX_EMBEDDINGS_PER_SPEAKER:
+                                speaker['embeddings'].append(representative_embedding)
+                                print(f"  Added embedding to {speaker_id} (avg similarity: {avg_similarity:.3f})")
+                            else:
+                                # Replace least representative embedding if new one is better
+                                mean_embedding = np.mean(speaker['embeddings'], axis=0)
+                                mean_embedding = mean_embedding / np.linalg.norm(mean_embedding)
+                                current_sims = cosine_similarity(speaker['embeddings'], [mean_embedding]).flatten()
+                                worst_idx = np.argmin(current_sims)
+                                new_sim = cosine_similarity([representative_embedding], [mean_embedding])[0][0]
+                                if new_sim > current_sims[worst_idx]:
+                                    speaker['embeddings'][worst_idx] = representative_embedding
+                                    print(f"  Replaced worst embedding in {speaker_id} (new sim: {new_sim:.3f} > old: {current_sims[worst_idx]:.3f})")
+                        else:
+                            print(f"  ⚠ Skipped adding embedding to {speaker_id} (avg similarity too low: {avg_similarity:.3f})")
                         break
             
             cluster_to_speaker[cluster_label] = speaker_id

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import asyncio
 import json
 import sounddevice as sd
@@ -11,7 +12,7 @@ BUFFER_SIZE = 1024
 
 # Silence detection parameters
 SILENCE_THRESHOLD = 0.05  # RMS amplitude threshold for silence detection
-SILENCE_DURATION_THRESHOLD = 10.0  # seconds - send chunk after 60s of silence
+SILENCE_DURATION_THRESHOLD = None  # Will be set from command-line args
 MIN_CHUNK_DURATION = 5.0  # seconds - minimum audio length to send
 MAX_CHUNK_DURATION = 240.0  # seconds - maximum chunk size (4 minutes)
 
@@ -151,7 +152,7 @@ async def main():
             ):
                 print("Listening... Press Ctrl+C to stop.")
                 print("\nNote: Audio is buffered and transcribed in chunks.")
-                print("Transcription triggers after 60 seconds of silence.")
+                print(f"Transcription triggers after {SILENCE_DURATION_THRESHOLD:.1f} seconds of silence.")
                 print("This provides more accurate results than real-time transcription.\n")
                 
                 # Run send and receive tasks concurrently
@@ -171,4 +172,29 @@ async def main():
         print(f"Error: {e}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Whisper audio transcription client with speaker diarization')
+    parser.add_argument(
+        '--silence-duration',
+        type=float,
+        default=60.0,
+        help='Seconds of silence before sending audio chunk for transcription (default: 60.0)'
+    )
+    parser.add_argument(
+        '--server-url',
+        type=str,
+        default=SERVER_URL,
+        help=f'WebSocket server URL (default: {SERVER_URL})'
+    )
+    
+    args = parser.parse_args()
+    
+    # Set global parameters from command-line arguments
+    SILENCE_DURATION_THRESHOLD = args.silence_duration
+    SERVER_URL = args.server_url
+    
+    print(f"Configuration:")
+    print(f"  Silence duration threshold: {SILENCE_DURATION_THRESHOLD}s")
+    print(f"  Server URL: {SERVER_URL}")
+    print()
+    
     asyncio.run(main())
